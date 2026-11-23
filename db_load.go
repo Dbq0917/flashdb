@@ -1,46 +1,71 @@
 package flashdb
 
 import (
+	"os"
 	"time"
 
 	"github.com/arriqaaq/aol"
 )
 
-// load String, Hash, Set and ZSet stores from append-only log
+// load rebuilds the in-memory stores. It first restores the most recent
+// compressed snapshot (if one exists) and then replays only the append-only
+// log segments written after the snapshot, instead of replaying the whole log.
 func (db *FlashDB) load() error {
 	if db.log == nil {
 		return nil
 	}
 
-	noOfSegments := db.log.Segments()
-	for i := 1; i <= noOfSegments; i++ {
-		j := 0
+	// Restore the snapshot first. firstSegment is the earliest log segment
+	// that may contain entries newer than the snapshot.
+	firstSegment, err := db.loadSnapshot()
+	if err != nil {
+		return err
+	}
 
-		for {
-			data, err := db.log.Read(uint64(i), uint64(j))
-			if err != nil {
-				if err == aol.ErrEOF {
-					break
-				}
-				return err
-			}
+	segments, err := listLogSegments(db.config.Path)
+	if err != nil {
+		return err
+	}
 
-			record, err := decode(data)
-			if err != nil {
-				return err
-			}
+	for _, segmentIndex := range segments {
+		if segmentIndex < firstSegment {
+			// Fully covered by the snapshot.
+			continue
+		}
 
-			if len(record.meta.key) > 0 {
-				if err := db.loadRecord(record); err != nil {
-					return err
-				}
-			}
-
-			j++
+		if err := db.replaySegment(segmentIndex); err != nil {
+			return err
 		}
 	}
 
 	return nil
+}
+
+// replaySegment applies every record stored in one log segment in order.
+func (db *FlashDB) replaySegment(segmentIndex uint64) error {
+	for j := uint64(0); ; j++ {
+		data, err := db.log.Read(segmentIndex, j)
+		if err != nil {
+			if err == aol.ErrEOF {
+				return nil
+			}
+			if os.IsNotExist(err) || err == aol.ErrNotFound {
+				return nil
+			}
+			return err
+		}
+
+		record, err := decode(data)
+		if err != nil {
+			return err
+		}
+
+		if len(record.meta.key) > 0 {
+			if err := db.loadRecord(record); err != nil {
+				return err
+			}
+		}
+	}
 }
 
 func (db *FlashDB) loadRecord(r *record) (err error) {
@@ -74,7 +99,7 @@ func (db *FlashDB) buildStringRecord(r *record) error {
 		db.strStore.Delete([]byte(key))
 		db.exps.HDel(String, key)
 	case StringExpire:
-		if r.timestamp < uint64(time.Now().Unix()) {
+		if r.timestamp < uint64(time.Now().Unix()) { // timestamp is an absolute deadline in seconds
 			db.strStore.Delete([]byte(key))
 			db.exps.HDel(String, key)
 		} else {
@@ -100,7 +125,7 @@ func (db *FlashDB) buildHashRecord(r *record) error {
 		db.hashStore.HClear(key)
 		db.exps.HDel(Hash, key)
 	case HashHExpire:
-		if r.timestamp < uint64(time.Now().Unix()) {
+		if r.timestamp < uint64(time.Now().Unix()) { // timestamp is an absolute deadline in seconds
 			db.hashStore.HClear(key)
 			db.exps.HDel(Hash, key)
 		} else {
@@ -128,7 +153,7 @@ func (db *FlashDB) buildSetRecord(r *record) error {
 		db.setStore.SClear(key)
 		db.exps.HDel(Set, key)
 	case SetSExpire:
-		if r.timestamp < uint64(time.Now().Unix()) {
+		if r.timestamp < uint64(time.Now().Unix()) { // timestamp is an absolute deadline in seconds
 			db.setStore.SClear(key)
 			db.exps.HDel(Set, key)
 		} else {
@@ -158,7 +183,7 @@ func (db *FlashDB) buildZsetRecord(r *record) error {
 		db.zsetStore.ZClear(key)
 		db.exps.HDel(ZSet, key)
 	case ZSetZExpire:
-		if r.timestamp < uint64(time.Now().Unix()) {
+		if r.timestamp < uint64(time.Now().Unix()) { // timestamp is an absolute deadline in seconds
 			db.zsetStore.ZClear(key)
 			db.exps.HDel(ZSet, key)
 		} else {

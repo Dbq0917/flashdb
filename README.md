@@ -17,6 +17,7 @@ Features
 - Embeddable with a simple API
 - Supports Redis like operations for SET, SORTED SET, HASH and STRING
 - [Durable append-only file](#append-only-file) format for persistence
+- [Compressed snapshots](#persistence-and-snapshots) for fast restart and log compaction
 - Option to evict old items with an [expiration](#data-expiration) TTL
 - ACID semantics with locking [transactions](#transactions) that support rollbacks
 
@@ -130,6 +131,49 @@ err := db.View(func(tx *flashdb.Tx) error {
 	fmt.Printf("value is %s\n", val)
 	return nil
 })
+```
+
+Persistence and snapshots
+=========================
+
+FlashDB persists every committed write transaction to an append-only log (AOL).
+On startup it replays the log to rebuild the in-memory stores. Replaying the
+entire log becomes slow once it grows to millions of entries, and the log files
+keep accumulating because stale versions and deletes are never removed.
+
+To bound restart time and disk usage, FlashDB supports compressed snapshots:
+
+- A snapshot is a point-in-time, gzip-compressed copy of the live data stored
+  as `snapshot.rdb` in the data directory. It records the log segment at which
+  it was taken.
+- After the snapshot is durably on disk, every sealed log segment it fully
+  covers is deleted. The current (tail) segment is always kept so writes that
+  arrive after the snapshot are never lost.
+- On recovery FlashDB loads the snapshot first and then replays only the log
+  segments written after it, instead of replaying the whole log. Replaying the
+  retained tail segment is idempotent, so re-applying its older entries is
+  safe.
+- Acknowledged writes are not lost: writes committed before the snapshot starts
+  are captured in it; writes committed while the snapshot runs stay in the log
+  and are replayed on top of the snapshot.
+
+Enable periodic snapshots with `SnapshotInterval` (in seconds). `0` (the
+default) keeps the original full-replay behavior with no snapshots:
+
+```go
+config := &flashdb.Config{
+	Path:             "/tmp/flashdb",
+	SnapshotInterval: 600, // take a snapshot every 10 minutes
+}
+db, err := flashdb.New(config)
+```
+
+A snapshot can also be triggered manually at any time:
+
+```go
+if err := db.Snapshot(); err != nil {
+	log.Fatal(err)
+}
 ```
 
 Commands

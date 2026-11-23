@@ -20,10 +20,13 @@ var (
 
 type (
 	FlashDB struct {
-		mu     sync.RWMutex
-		config *Config
-		exps   *hash.Hash // hashmap of ttl keys
-		log    *aol.Log
+		mu           sync.RWMutex
+		config       *Config
+		exps         *hash.Hash // hashmap of ttl keys
+		log          *aol.Log
+		snapshotMu   sync.Mutex // serializes snapshots
+		snapshotStop chan struct{}
+		snapshotDone chan struct{}
 
 		closed  bool // set when the database has been closed
 		persist bool // do we write to disk
@@ -79,6 +82,10 @@ func New(config *Config) (*FlashDB, error) {
 		err = db.load()
 		if err != nil {
 			return nil, err
+		}
+
+		if config.snapshotInterval() > 0 {
+			db.startSnapshotScheduler(config.snapshotInterval())
 		}
 	}
 
@@ -137,6 +144,10 @@ func (db *FlashDB) evict(key string, dType DataType) {
 
 func (db *FlashDB) Close() error {
 	db.closed = true
+	if db.snapshotStop != nil {
+		close(db.snapshotStop)
+		<-db.snapshotDone
+	}
 	for _, evictor := range db.evictors {
 		evictor.stop()
 	}
